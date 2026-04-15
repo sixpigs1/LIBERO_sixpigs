@@ -205,7 +205,7 @@ if __name__ == "__main__":
         "--robots",
         nargs="+",
         type=str,
-        default="Panda",
+        default=["Panda"],
         help="Which robot(s) to use in the env",
     )
     parser.add_argument(
@@ -312,9 +312,9 @@ if __name__ == "__main__":
         device = Keyboard(
             pos_sensitivity=args.pos_sensitivity, rot_sensitivity=args.rot_sensitivity
         )
-        env.viewer.add_keypress_callback("any", device.on_press)
-        env.viewer.add_keyup_callback("any", device.on_release)
-        env.viewer.add_keyrepeat_callback("any", device.on_press)
+        env.viewer.add_keypress_callback(device.on_press)
+        env.viewer.add_keyup_callback(device.on_release)
+        env.viewer.add_keyrepeat_callback(device.on_press)
     elif args.device == "spacemouse":
         from robosuite.devices import SpaceMouse
 
