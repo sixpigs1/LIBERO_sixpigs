@@ -205,7 +205,7 @@ if __name__ == "__main__":
         "--robots",
         nargs="+",
         type=str,
-        default=["Panda"],
+        default="Panda",
         help="Which robot(s) to use in the env",
     )
     parser.add_argument(
@@ -312,9 +312,10 @@ if __name__ == "__main__":
         device = Keyboard(
             pos_sensitivity=args.pos_sensitivity, rot_sensitivity=args.rot_sensitivity
         )
-        env.viewer.add_keypress_callback(device.on_press)
-        env.viewer.add_keyup_callback(device.on_release)
-        env.viewer.add_keyrepeat_callback(device.on_press)
+        # Keyboard uses pynput.Listener internally and does not need viewer callbacks.
+        # The old add_keypress/keyup/keyrepeat_callback API belongs to MujocoPyRenderer
+        # (mujoco-py era). The current robosuite uses OpenCVRenderer which only exposes
+        # add_keypress_callback(fn) with a single argument, and Keyboard works without it.
     elif args.device == "spacemouse":
         from robosuite.devices import SpaceMouse
 

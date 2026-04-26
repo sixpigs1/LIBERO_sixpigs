@@ -8,6 +8,11 @@ import robosuite
 import robosuite.utils.transform_utils as T
 import robosuite.macros as macros
 
+# Force OpenCV image convention (top-left origin) so that camera observations
+# are stored right-side up.  MuJoCo's default is OpenGL (bottom-left origin),
+# which produces upside-down images in the saved HDF5 and LeRobot dataset.
+macros.IMAGE_CONVENTION = "opencv"
+
 import init_path
 import libero.libero.utils.utils as libero_utils
 import cv2
@@ -65,9 +70,11 @@ def main():
     bddl_file_name = f["data"].attrs["bddl_file_name"]
 
     bddl_file_dir = os.path.dirname(bddl_file_name)
-    replace_bddl_prefix = "/".join(bddl_file_dir.split("bddl_files/")[:-1] + "bddl_files")
+    replace_bddl_prefix = "/".join(bddl_file_dir.split("bddl_files/")[:-1]) + "bddl_files"
 
-    hdf5_path = os.path.join(get_libero_path("datasets"), bddl_file_dir.split("bddl_files/")[-1].replace(".bddl", "_demo.hdf5"))
+    suite_name = bddl_file_dir.split("bddl_files/")[-1]   # e.g. "libero_spatial"
+    task_name  = os.path.splitext(os.path.basename(bddl_file_name))[0]  # filename without .bddl
+    hdf5_path = os.path.join(get_libero_path("datasets"), suite_name, task_name + "_demo.hdf5")
 
     output_parent_dir = Path(hdf5_path).parent
     output_parent_dir.mkdir(parents=True, exist_ok=True)
@@ -78,13 +85,13 @@ def main():
 
     grp.attrs["env_name"] = env_name
     grp.attrs["problem_info"] = f["data"].attrs["problem_info"]
-    grp.attrs["macros_image_convention"] = macros.IMAGE_CONVENTION
+    grp.attrs["macros_image_convention"] = "opencv"  # always opencv after the fix above
 
     libero_utils.update_env_kwargs(
         env_kwargs,
         bddl_file_name=bddl_file_name,
-        has_renderer=not args.use_camera_obs,
-        has_offscreen_renderer=args.use_camera_obs,
+        has_renderer=False,
+        has_offscreen_renderer=True,
         ignore_done=True,
         use_camera_obs=args.use_camera_obs,
         camera_depths=args.use_depth,
@@ -94,8 +101,8 @@ def main():
         ],
         reward_shaping=True,
         control_freq=20,
-        camera_heights=128,
-        camera_widths=128,
+        camera_heights=256,
+        camera_widths=256,
         camera_segmentations=None,
     )
 
@@ -123,7 +130,7 @@ def main():
     cap_index = 5
 
     for (i, ep) in enumerate(demos):
-        print("Playing back random episode... (press ESC to quit)")
+        print(f"Replaying episode {i+1}/{len(demos)}: {ep}")
 
         # # select an episode randomly
         # read the model xml, using the metadata stored in the attribute for this episode
@@ -137,9 +144,6 @@ def main():
                 continue
 
         model_xml = libero_utils.postprocess_model_xml(model_xml, {})
-
-        if not args.use_camera_obs:
-            env.viewer.set_camera(0)
 
         # load the flattened mujoco states
         states = f["data/{}/states".format(ep)][()]
@@ -220,7 +224,7 @@ def main():
                 agentview_images.append(obs["agentview_image"])
                 eye_in_hand_images.append(obs["robot0_eye_in_hand_image"])
             else:
-                env.render()
+                pass  # has_renderer=False, no on-screen render needed
 
         # end of one trajectory
         states = states[valid_index]

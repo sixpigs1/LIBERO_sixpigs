@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  run_pipeline.sh  —  Suite-level LIBERO data collection & conversion pipeline
+#
+#  Processes ALL tasks in a chosen suite, one by one, and outputs a single
+#  LeRobot v2.1 dataset that covers the entire suite.
+#
+#  Resume support
+#  ──────────────
+#  Progress is recorded in:
+#      <collected_dir>/<suite_name>/.pipeline_state
+#  Each line: "<task_name>=done"
+#  On re-run the script automatically skips completed tasks.
+#  If an intermediate demo.hdf5 already has enough demos it is reused
+#  instead of re-collecting.
+#
+#  Steps per task:
+#    1. Collect human demonstrations  (collect_demonstration.py)
+#    2. Filter static frames          (filter_static_frames.py)
+#    3. Replay & render to HDF5       (create_dataset.py)
+#  Final step (once, after all tasks):
+#    4. Convert whole suite to LeRobot v2.1  (convert_libero_to_lerobot.py)
+#
+#  Usage:
+#    bash scripts/run_pipeline.sh --suite spatial [options]
+#
+#  Run  bash scripts/run_pipeline.sh --help  for the full option list.
+# =============================================================================
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+BDDL_ROOT="${REPO_ROOT}/libero/libero/bddl_files"
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+SUITE=""
+DEVICE="keyboard"
+COLLECTED_DIR="${REPO_ROOT}/collected_demos"
+NUM_DEMOS=3
+ROBOTS="Panda"
+LEROBOT_OUT_ROOT="${REPO_ROOT}/datasets/lerobot"
+CONDA_ENV="libero"
+
+FILTER_STATIC=true
+ACTION_THRESHOLD=0.001
+MIN_STATIC_RUN=1
+
+# ── Suite name resolver ────────────────────────────────────────────────────────
+resolve_suite() {
+    case "$1" in
+        spatial|libero_spatial)  echo "libero_spatial"  ;;
+        goal|libero_goal)        echo "libero_goal"     ;;
+        object|libero_object)    echo "libero_object"   ;;
+        10|libero_10)            echo "libero_10"       ;;
+        90|libero_90)            echo "libero_90"       ;;
+        *) echo "" ;;
+    esac
+}
+
+# ── Help ───────────────────────────────────────────────────────────────────────
+usage() {
+    cat <<EOF
+Usage: bash scripts/run_pipeline.sh --suite <name> [options]
+
+Suite selection (required):
+  --suite <spatial|goal|object|10|90>
+                              The LIBERO task suite to process.
+                              All .bddl tasks in that suite will be collected.
+
+Collection options:
+  --num-demonstrations <N>    Demonstrations per task (default: ${NUM_DEMOS}).
+  --device <keyboard|spacemouse>
+                              Teleoperation device (default: ${DEVICE}).
+  --directory <path>          Root dir for collected intermediate demos
+                              (default: ./collected_demos).
+  --robots <Panda|...>        Robot type for robosuite (default: ${ROBOTS}).
+
+Output options:
+  --lerobot-output <path>     Root dir for LeRobot datasets
+                              (default: ./datasets/lerobot).
+
+Filtering options:
+  --no-filter                 Skip the static-frame filtering step.
+  --action-threshold <float>  EEF action norm threshold for static detection
+                              (default: ${ACTION_THRESHOLD}).
+  --min-static-run <int>      Min consecutive static frames to remove
+                              (default: ${MIN_STATIC_RUN}).
+
+Environment:
+  --conda-env <name>          Conda environment name (default: ${CONDA_ENV}).
+                              Pass "" to use the currently active Python.
+
+  -h, --help                  Show this message and exit.
+
+Resume behaviour:
+  Progress is saved in <directory>/<suite>/.pipeline_state after each task.
+  Simply re-run the same command to resume after an interruption.
+  To restart from scratch, delete that state file.
+
+Examples:
+  bash scripts/run_pipeline.sh --suite spatial --num-demonstrations 5
+  bash scripts/run_pipeline.sh --suite goal --device spacemouse
+  bash scripts/run_pipeline.sh --suite 10 --num-demonstrations 10 --no-filter
+EOF
+    exit 0
+}
+
+# ── Argument parsing ───────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --suite)               SUITE="$2";                shift 2 ;;
+        --num-demonstrations)  NUM_DEMOS="$2";             shift 2 ;;
+        --device)              DEVICE="$2";                shift 2 ;;
+        --directory)           COLLECTED_DIR="$2";         shift 2 ;;
+        --robots)              ROBOTS="$2";                shift 2 ;;
+        --lerobot-output)      LEROBOT_OUT_ROOT="$2";      shift 2 ;;
+        --no-filter)           FILTER_STATIC=false;        shift   ;;
+        --action-threshold)    ACTION_THRESHOLD="$2";      shift 2 ;;
+        --min-static-run)      MIN_STATIC_RUN="$2";        shift 2 ;;
+        --conda-env)           CONDA_ENV="$2";             shift 2 ;;
+        -h|--help)             usage ;;
+        *) echo "[error] Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+# ── Validate suite ─────────────────────────────────────────────────────────────
+if [[ -z "${SUITE}" ]]; then
+    echo "[error] --suite is required.  Choices: spatial | goal | object | 10 | 90" >&2
+    exit 1
+fi
+
+SUITE_NAME="$(resolve_suite "${SUITE}")"
+if [[ -z "${SUITE_NAME}" ]]; then
+    echo "[error] Unknown suite '${SUITE}'.  Choices: spatial | goal | object | 10 | 90" >&2
+    exit 1
+fi
+
+BDDL_DIR="${BDDL_ROOT}/${SUITE_NAME}"
+if [[ ! -d "${BDDL_DIR}" ]]; then
+    echo "[error] BDDL directory not found: ${BDDL_DIR}" >&2
+    exit 1
+fi
+
+# Collect all .bddl task files, sorted alphabetically for determinism
+mapfile -t BDDL_FILES < <(find "${BDDL_DIR}" -name "*.bddl" | sort)
+TOTAL_TASKS=${#BDDL_FILES[@]}
+
+if [[ ${TOTAL_TASKS} -eq 0 ]]; then
+    echo "[error] No .bddl files found in ${BDDL_DIR}" >&2
+    exit 1
+fi
+
+# ── Python runner ──────────────────────────────────────────────────────────────
+if [[ -n "${CONDA_ENV}" ]]; then
+    PYTHON="conda run --no-capture-output -n ${CONDA_ENV} python"
+else
+    PYTHON="python"
+fi
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+SUITE_COLLECTED_DIR="${COLLECTED_DIR}/${SUITE_NAME}"
+LIBERO_DATASETS="${REPO_ROOT}/datasets/datasets/${SUITE_NAME}"
+LEROBOT_OUT="${LEROBOT_OUT_ROOT}/${SUITE_NAME}_lerobot"
+STATE_FILE="${SUITE_COLLECTED_DIR}/.pipeline_state"
+
+mkdir -p "${SUITE_COLLECTED_DIR}"
+
+# ── Banner ─────────────────────────────────────────────────────────────────────
+cat <<EOF
+
+╔══════════════════════════════════════════════════════════════════╗
+║              LIBERO Suite Pipeline                               ║
+╠══════════════════════════════════════════════════════════════════╣
+  Suite       : ${SUITE_NAME}  (${TOTAL_TASKS} tasks)
+  Demos/task  : ${NUM_DEMOS}
+  Device      : ${DEVICE}
+  Robots      : ${ROBOTS}
+  Filter      : ${FILTER_STATIC}  (thresh=${ACTION_THRESHOLD}, min_run=${MIN_STATIC_RUN})
+  Conda env   : ${CONDA_ENV:-"(current environment)"}
+  Collected   : ${SUITE_COLLECTED_DIR}
+  LIBERO HDF5 : ${LIBERO_DATASETS}
+  LeRobot out : ${LEROBOT_OUT}
+  State file  : ${STATE_FILE}
+╚══════════════════════════════════════════════════════════════════╝
+
+EOF
+
+cd "${REPO_ROOT}"
+
+# ── Helper: is task already done? ─────────────────────────────────────────────
+task_is_done() {
+    local task_name="$1"
+    [[ -f "${STATE_FILE}" ]] && grep -qx "${task_name}=done" "${STATE_FILE}"
+}
+
+# ── Helper: mark task as done ─────────────────────────────────────────────────
+mark_task_done() {
+    local task_name="$1"
+    echo "${task_name}=done" >> "${STATE_FILE}"
+}
+
+# ── Helper: count demo groups in an HDF5 file ─────────────────────────────────
+count_demos_in_hdf5() {
+    local hdf5="$1"
+    ${PYTHON} - "${hdf5}" <<'PYEOF' 2>/dev/null || echo 0
+import sys, h5py
+try:
+    with h5py.File(sys.argv[1], "r") as f:
+        print(len([k for k in f["data"].keys() if k.startswith("demo")]))
+except Exception:
+    print(0)
+PYEOF
+}
+
+# ── Helper: find usable intermediate demo.hdf5 for a task ─────────────────────
+#  Searches <suite_collected_dir>/<task_name>/ for a demo.hdf5 with >= NUM_DEMOS.
+find_ready_intermediate() {
+    local task_name="$1"
+    local task_dir="${SUITE_COLLECTED_DIR}/${task_name}"
+    [[ -d "${task_dir}" ]] || return 0
+
+    while IFS= read -r -d '' candidate; do
+        local n
+        n="$(count_demos_in_hdf5 "${candidate}")"
+        if (( n >= NUM_DEMOS )); then
+            echo "${candidate}"
+            return 0
+        fi
+    done < <(find "${task_dir}" -name "demo.hdf5" -print0 2>/dev/null)
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main loop — process each task
+# ═══════════════════════════════════════════════════════════════════════════════
+TASK_NUM=0
+SKIPPED=0
+PROCESSED=0
+
+for BDDL_FILE in "${BDDL_FILES[@]}"; do
+    TASK_NUM=$(( TASK_NUM + 1 ))
+    TASK_NAME="$(basename "${BDDL_FILE}" .bddl)"
+    LIBERO_STD_HDF5="${LIBERO_DATASETS}/${TASK_NAME}_demo.hdf5"
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    printf "  Task %d/%d: %s\n" "${TASK_NUM}" "${TOTAL_TASKS}" "${TASK_NAME}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # ── Resume check 1: recorded as done in state file ────────────────────────
+    if task_is_done "${TASK_NAME}"; then
+        echo "  [skip] Already completed (state file)."
+        SKIPPED=$(( SKIPPED + 1 ))
+        echo ""
+        continue
+    fi
+
+    # ── Resume check 2: LIBERO-std HDF5 already has enough demos ──────────────
+    if [[ -f "${LIBERO_STD_HDF5}" ]]; then
+        EXISTING="$(count_demos_in_hdf5 "${LIBERO_STD_HDF5}")"
+        if (( EXISTING >= NUM_DEMOS )); then
+            echo "  [skip] LIBERO HDF5 already has ${EXISTING}/${NUM_DEMOS} demos."
+            mark_task_done "${TASK_NAME}"
+            SKIPPED=$(( SKIPPED + 1 ))
+            echo ""
+            continue
+        else
+            echo "  [info] LIBERO HDF5 has ${EXISTING}/${NUM_DEMOS} demos — will redo."
+        fi
+    fi
+
+    # ── Per-task collection directory ─────────────────────────────────────────
+    TASK_COLLECT_DIR="${SUITE_COLLECTED_DIR}/${TASK_NAME}"
+    mkdir -p "${TASK_COLLECT_DIR}"
+
+    # ── Step 1: Collect demonstrations ────────────────────────────────────────
+    DEMO_HDF5="$(find_ready_intermediate "${TASK_NAME}")"
+
+    if [[ -n "${DEMO_HDF5}" ]]; then
+        echo "  ▶ [1/3] Reusing existing intermediate ($(count_demos_in_hdf5 "${DEMO_HDF5}") demos):"
+        echo "          ${DEMO_HDF5}"
+    else
+        echo "  ▶ [1/3] Collecting ${NUM_DEMOS} demonstration(s) ..."
+        echo "          Press SPACE to start/stop recording, ESC to finish each demo."
+        echo ""
+
+        ${PYTHON} scripts/collect_demonstration.py \
+            --bddl-file         "${BDDL_FILE}" \
+            --device            "${DEVICE}" \
+            --directory         "${TASK_COLLECT_DIR}" \
+            --num-demonstration "${NUM_DEMOS}" \
+            --robots            "${ROBOTS}"
+
+        # Locate the newly created demo.hdf5 (most recently modified)
+        DEMO_HDF5="$(find "${TASK_COLLECT_DIR}" -name "demo.hdf5" \
+                     -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)"
+
+        if [[ -z "${DEMO_HDF5}" || ! -f "${DEMO_HDF5}" ]]; then
+            echo "  [error] Could not locate demo.hdf5 after collection — skipping task." >&2
+            echo ""
+            continue
+        fi
+        echo "  [info] demo file: ${DEMO_HDF5}"
+    fi
+
+    # ── Step 2: Create LIBERO-standard HDF5 (replay full unfiltered trajectory) ─
+    # IMPORTANT: filtering must happen AFTER this step.
+    # Filtering the intermediate HDF5 before replay breaks state continuity
+    # and causes "playback diverged" warnings + incorrect rendered observations.
+    echo ""
+    echo "  ▶ [2/3] Replaying demos and rendering images ..."
+    ${PYTHON} scripts/create_dataset.py \
+        --demo-file      "${DEMO_HDF5}" \
+        --use-camera-obs \
+        --use-actions
+
+    echo "  [info] LIBERO HDF5: ${LIBERO_STD_HDF5}"
+
+    # ── Step 3: Filter static frames from the rendered LIBERO-std HDF5 ────────
+    # Now it is safe to filter: all observations have been rendered from the
+    # correct (contiguous) simulation trajectory.  Filtering here simply removes
+    # redundant (obs, action) pairs from the already-rendered dataset.
+    echo ""
+    if [[ "${FILTER_STATIC}" == "true" ]]; then
+        echo "  ▶ [3/3] Filtering static frames from rendered HDF5 ..."
+        ${PYTHON} scripts/filter_static_frames.py \
+            --demo-file        "${LIBERO_STD_HDF5}" \
+            --action-threshold "${ACTION_THRESHOLD}" \
+            --state-threshold  "0.002" \
+            --min-static-run   "${MIN_STATIC_RUN}" \
+            --inplace
+    else
+        echo "  ▶ [3/3] Filtering skipped (--no-filter)."
+    fi
+    mark_task_done "${TASK_NAME}"
+    PROCESSED=$(( PROCESSED + 1 ))
+    echo ""
+done
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Final step — convert the whole suite to LeRobot v2.1
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  Final: Converting suite → LeRobot v2.1"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  input  : ${LIBERO_DATASETS}"
+echo "  output : ${LEROBOT_OUT}"
+echo ""
+
+${PYTHON} scripts/convert_libero_to_lerobot.py \
+    --input-dir  "${LIBERO_DATASETS}" \
+    --output-dir "${LEROBOT_OUT}"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Summary
+# ═══════════════════════════════════════════════════════════════════════════════
+cat <<EOF
+
+╔══════════════════════════════════════════════════════════════════╗
+║  ✓  Pipeline complete!                                           ║
+╠══════════════════════════════════════════════════════════════════╣
+  Suite          : ${SUITE_NAME}
+  Total tasks    : ${TOTAL_TASKS}
+  Newly processed: ${PROCESSED}
+  Skipped (done) : ${SKIPPED}
+  LeRobot dataset: ${LEROBOT_OUT}
+╚══════════════════════════════════════════════════════════════════╝
+EOF
