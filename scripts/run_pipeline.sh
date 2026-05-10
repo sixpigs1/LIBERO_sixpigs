@@ -40,6 +40,7 @@ ROBOTS="Panda"
 LEROBOT_OUT_ROOT="${REPO_ROOT}/datasets/lerobot"
 CONDA_ENV="libero"
 UARM_PORT="/dev/ttyUSB0"
+UARM_OUTPUT_MAX="0.05"
 
 # ── Suite name resolver ────────────────────────────────────────────────────────
 resolve_suite() {
@@ -71,6 +72,9 @@ Collection options:
                               serial port; JOINT_POSITION controller is used.
   --uarm-port <path>          Serial port for the U-ARM device
                               (default: ${UARM_PORT}, only used when --device uarm).
+  --uarm-output-max <float>   JOINT_POSITION output_max in rad/step (default: ${UARM_OUTPUT_MAX}).
+                              Hard ceiling per control step; increase for faster arm motion.
+                              E.g. 0.2 → ~11.5 deg/step max.
   --directory <path>          Root dir for collected intermediate demos
                               (default: ./collected_demos).
   --robots <Panda|...>        Robot type for robosuite (default: ${ROBOTS}).
@@ -105,6 +109,7 @@ while [[ $# -gt 0 ]]; do
         --num-demonstrations)  NUM_DEMOS="$2";             shift 2 ;;
         --device)              DEVICE="$2";                shift 2 ;;
         --uarm-port)           UARM_PORT="$2";             shift 2 ;;
+        --uarm-output-max)     UARM_OUTPUT_MAX="$2";       shift 2 ;;
         --directory)           COLLECTED_DIR="$2";         shift 2 ;;
         --robots)              ROBOTS="$2";                shift 2 ;;
         --lerobot-output)      LEROBOT_OUT_ROOT="$2";      shift 2 ;;
@@ -278,7 +283,7 @@ for BDDL_FILE in "${BDDL_FILES[@]}"; do
             --directory         "${TASK_COLLECT_DIR}" \
             --num-demonstration "${NUM_DEMOS}" \
             --robots            "${ROBOTS}" \
-            $([[ "${DEVICE}" == "uarm" ]] && echo "--uarm-port ${UARM_PORT}")
+            $([[ "${DEVICE}" == "uarm" ]] && echo "--uarm-port ${UARM_PORT} --uarm-output-max ${UARM_OUTPUT_MAX}")
 
         # Locate the newly created demo.hdf5 (most recently modified)
         DEMO_HDF5="$(find "${TASK_COLLECT_DIR}" -name "demo.hdf5" \
