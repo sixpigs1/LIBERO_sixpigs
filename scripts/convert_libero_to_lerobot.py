@@ -133,7 +133,7 @@ HF_FEATURES = {
     },
     "action": {
         "feature": {"dtype": "float32", "_type": "Value"},
-        "length": 7,
+        "length": 8,
         "_type": "Sequence",
     },
     "timestamp":     {"dtype": "float32", "_type": "Value"},
@@ -166,13 +166,13 @@ def write_parquet(rows: dict, path: Path):
     arrays.append(obs_state)
     fields.append(pa.field("observation.state", pa.list_(pa.float32(), 8)))
 
-    # action  (fixed_size_list<float32>[7])
+    # action  (fixed_size_list<float32>[8])  —  7 joint deltas + 1 gripper
     action = pa.array(
         [row.tolist() for row in rows["action"]],
-        type=pa.list_(pa.float32(), 7),
+        type=pa.list_(pa.float32(), 8),
     )
     arrays.append(action)
-    fields.append(pa.field("action", pa.list_(pa.float32(), 7)))
+    fields.append(pa.field("action", pa.list_(pa.float32(), 8)))
 
     # scalar columns
     for col, arrow_type in [
@@ -304,12 +304,12 @@ def build_info_json(
             },
             "action": {
                 "dtype": "float32",
-                "shape": [7],
+                "shape": [8],
                 "names": {
                     "motors": [
-                        "x", "y", "z",
-                        "axis_angle1", "axis_angle2", "axis_angle3",
-                        "gripper",
+                        "joint0", "joint1", "joint2",
+                        "joint3", "joint4", "joint5",
+                        "joint6", "gripper",
                     ]
                 },
             },

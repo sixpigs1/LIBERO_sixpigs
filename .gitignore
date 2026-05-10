@@ -16,3 +16,9 @@ logs/
 *.mp4
 libero.egg-info/
 .vscode/
+
+libero_10_no_noops_1.0.0_lerobot
+LIBERO_代码库分析与数据收集指南.md
+command.md
+collected_demos
+demonstration_data

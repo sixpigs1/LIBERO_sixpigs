@@ -62,13 +62,18 @@ def collect_human_trajectory(
             else env.robots[arm == "left"]
         )
 
-        # Get the newest action
-        action, grasp = input2action(
-            device=device,
-            robot=active_robot,
-            active_arm=arm,
-            env_configuration=env_configuration,
-        )
+        # Get the newest action.
+        # UArmDevice provides a get_action() method that returns a
+        # JOINT_VELOCITY action directly (bypasses input2action).
+        if hasattr(device, "get_action"):
+            action, grasp = device.get_action(robot=active_robot)
+        else:
+            action, grasp = input2action(
+                device=device,
+                robot=active_robot,
+                active_arm=arm,
+                env_configuration=env_configuration,
+            )
 
         # If action is none, then this a reset so we should break
         if action is None:
@@ -205,7 +210,7 @@ if __name__ == "__main__":
         "--robots",
         nargs="+",
         type=str,
-        default="Panda",
+        default=["Panda"],
         help="Which robot(s) to use in the env",
     )
     parser.add_argument(
@@ -223,8 +228,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--camera",
         type=str,
-        default="agentview",
-        help="Which camera to use for collecting demos",
+        default="sideview_rear",
+        help="Which camera to use for the visualisation window during collection. "
+             "Does NOT affect the camera observations saved in the dataset. "
+             "Choices: agentview | frontview | sideview | sideview_rear",
     )
     parser.add_argument(
         "--controller",
@@ -232,7 +239,26 @@ if __name__ == "__main__":
         default="OSC_POSE",
         help="Choice of controller. Can be 'IK_POSE' or 'OSC_POSE'",
     )
-    parser.add_argument("--device", type=str, default="spacemouse")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="spacemouse",
+        choices=["keyboard", "spacemouse", "uarm"],
+        help="Teleoperation device.  'uarm' requires --controller to be overridden "
+             "to JOINT_VELOCITY (done automatically).",
+    )
+    parser.add_argument(
+        "--uarm-port",
+        type=str,
+        default="/dev/ttyUSB0",
+        help="Serial port for the U-ARM device (default: /dev/ttyUSB0).",
+    )
+    parser.add_argument(
+        "--uarm-baudrate",
+        type=int,
+        default=115200,
+        help="Baud rate for the U-ARM serial connection (default: 115200).",
+    )
     parser.add_argument(
         "--pos-sensitivity",
         type=float,
@@ -246,6 +272,12 @@ if __name__ == "__main__":
         help="How much to scale rotation user inputs",
     )
     parser.add_argument(
+        "--uarm-sensitivity",
+        type=float,
+        default=30,
+        help="How much to scale uaarm user inputs (only applicable if --device=uarm)",
+    )
+    parser.add_argument(
         "--num-demonstration",
         type=int,
         default=50,
@@ -257,6 +289,10 @@ if __name__ == "__main__":
     parser.add_argument("--product-id", type=int, default=50734)
 
     args = parser.parse_args()
+
+    if args.device == "uarm":
+        args.controller = "JOINT_VELOCITY"
+        print("[INFO] U-ARM device selected: controller overridden to JOINT_POSITION.")
 
     # Get controller config
     controller_config = load_controller_config(default_controller=args.controller)
@@ -325,9 +361,17 @@ if __name__ == "__main__":
             pos_sensitivity=args.pos_sensitivity,
             rot_sensitivity=args.rot_sensitivity,
         )
+    elif args.device == "uarm":
+        from libero.libero.devices.uarm_device import UArmDevice
+
+        device = UArmDevice(
+            port=args.uarm_port,
+            baudrate=args.uarm_baudrate,
+            sensitivity=args.uarm_sensitivity,
+        )
     else:
         raise Exception(
-            "Invalid device choice: choose either 'keyboard' or 'spacemouse'."
+            "Invalid device choice: choose 'keyboard', 'spacemouse', or 'uarm'."
         )
 
     # make a new timestamped directory

@@ -16,10 +16,9 @@
 #
 #  Steps per task:
 #    1. Collect human demonstrations  (collect_demonstration.py)
-#    2. Filter static frames          (filter_static_frames.py)
-#    3. Replay & render to HDF5       (create_dataset.py)
+#    2. Replay & render to HDF5       (create_dataset.py)
 #  Final step (once, after all tasks):
-#    4. Convert whole suite to LeRobot v2.1  (convert_libero_to_lerobot.py)
+#    3. Convert whole suite to LeRobot v2.1  (convert_libero_to_lerobot.py)
 #
 #  Usage:
 #    bash scripts/run_pipeline.sh --suite spatial [options]
@@ -34,16 +33,13 @@ BDDL_ROOT="${REPO_ROOT}/libero/libero/bddl_files"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 SUITE=""
-DEVICE="keyboard"
+DEVICE="uarm"
 COLLECTED_DIR="${REPO_ROOT}/collected_demos"
 NUM_DEMOS=3
 ROBOTS="Panda"
 LEROBOT_OUT_ROOT="${REPO_ROOT}/datasets/lerobot"
 CONDA_ENV="libero"
-
-FILTER_STATIC=true
-ACTION_THRESHOLD=0.001
-MIN_STATIC_RUN=1
+UARM_PORT="/dev/ttyUSB0"
 
 # ── Suite name resolver ────────────────────────────────────────────────────────
 resolve_suite() {
@@ -69,8 +65,12 @@ Suite selection (required):
 
 Collection options:
   --num-demonstrations <N>    Demonstrations per task (default: ${NUM_DEMOS}).
-  --device <keyboard|spacemouse>
+  --device <keyboard|spacemouse|uarm>
                               Teleoperation device (default: ${DEVICE}).
+                              'uarm' reads from a physical U-ARM servo arm via
+                              serial port; JOINT_POSITION controller is used.
+  --uarm-port <path>          Serial port for the U-ARM device
+                              (default: ${UARM_PORT}, only used when --device uarm).
   --directory <path>          Root dir for collected intermediate demos
                               (default: ./collected_demos).
   --robots <Panda|...>        Robot type for robosuite (default: ${ROBOTS}).
@@ -78,13 +78,6 @@ Collection options:
 Output options:
   --lerobot-output <path>     Root dir for LeRobot datasets
                               (default: ./datasets/lerobot).
-
-Filtering options:
-  --no-filter                 Skip the static-frame filtering step.
-  --action-threshold <float>  EEF action norm threshold for static detection
-                              (default: ${ACTION_THRESHOLD}).
-  --min-static-run <int>      Min consecutive static frames to remove
-                              (default: ${MIN_STATIC_RUN}).
 
 Environment:
   --conda-env <name>          Conda environment name (default: ${CONDA_ENV}).
@@ -100,7 +93,7 @@ Resume behaviour:
 Examples:
   bash scripts/run_pipeline.sh --suite spatial --num-demonstrations 5
   bash scripts/run_pipeline.sh --suite goal --device spacemouse
-  bash scripts/run_pipeline.sh --suite 10 --num-demonstrations 10 --no-filter
+  bash scripts/run_pipeline.sh --suite 10 --num-demonstrations 10 --device uarm
 EOF
     exit 0
 }
@@ -111,12 +104,10 @@ while [[ $# -gt 0 ]]; do
         --suite)               SUITE="$2";                shift 2 ;;
         --num-demonstrations)  NUM_DEMOS="$2";             shift 2 ;;
         --device)              DEVICE="$2";                shift 2 ;;
+        --uarm-port)           UARM_PORT="$2";             shift 2 ;;
         --directory)           COLLECTED_DIR="$2";         shift 2 ;;
         --robots)              ROBOTS="$2";                shift 2 ;;
         --lerobot-output)      LEROBOT_OUT_ROOT="$2";      shift 2 ;;
-        --no-filter)           FILTER_STATIC=false;        shift   ;;
-        --action-threshold)    ACTION_THRESHOLD="$2";      shift 2 ;;
-        --min-static-run)      MIN_STATIC_RUN="$2";        shift 2 ;;
         --conda-env)           CONDA_ENV="$2";             shift 2 ;;
         -h|--help)             usage ;;
         *) echo "[error] Unknown option: $1" >&2; exit 1 ;;
@@ -175,7 +166,6 @@ cat <<EOF
   Demos/task  : ${NUM_DEMOS}
   Device      : ${DEVICE}
   Robots      : ${ROBOTS}
-  Filter      : ${FILTER_STATIC}  (thresh=${ACTION_THRESHOLD}, min_run=${MIN_STATIC_RUN})
   Conda env   : ${CONDA_ENV:-"(current environment)"}
   Collected   : ${SUITE_COLLECTED_DIR}
   LIBERO HDF5 : ${LIBERO_DATASETS}
@@ -275,10 +265,10 @@ for BDDL_FILE in "${BDDL_FILES[@]}"; do
     DEMO_HDF5="$(find_ready_intermediate "${TASK_NAME}")"
 
     if [[ -n "${DEMO_HDF5}" ]]; then
-        echo "  ▶ [1/3] Reusing existing intermediate ($(count_demos_in_hdf5 "${DEMO_HDF5}") demos):"
+        echo "  ▶ [1/2] Reusing existing intermediate ($(count_demos_in_hdf5 "${DEMO_HDF5}") demos):"
         echo "          ${DEMO_HDF5}"
     else
-        echo "  ▶ [1/3] Collecting ${NUM_DEMOS} demonstration(s) ..."
+        echo "  ▶ [1/2] Collecting ${NUM_DEMOS} demonstration(s) ..."
         echo "          Press SPACE to start/stop recording, ESC to finish each demo."
         echo ""
 
@@ -287,7 +277,8 @@ for BDDL_FILE in "${BDDL_FILES[@]}"; do
             --device            "${DEVICE}" \
             --directory         "${TASK_COLLECT_DIR}" \
             --num-demonstration "${NUM_DEMOS}" \
-            --robots            "${ROBOTS}"
+            --robots            "${ROBOTS}" \
+            $([[ "${DEVICE}" == "uarm" ]] && echo "--uarm-port ${UARM_PORT}")
 
         # Locate the newly created demo.hdf5 (most recently modified)
         DEMO_HDF5="$(find "${TASK_COLLECT_DIR}" -name "demo.hdf5" \
@@ -301,12 +292,9 @@ for BDDL_FILE in "${BDDL_FILES[@]}"; do
         echo "  [info] demo file: ${DEMO_HDF5}"
     fi
 
-    # ── Step 2: Create LIBERO-standard HDF5 (replay full unfiltered trajectory) ─
-    # IMPORTANT: filtering must happen AFTER this step.
-    # Filtering the intermediate HDF5 before replay breaks state continuity
-    # and causes "playback diverged" warnings + incorrect rendered observations.
+    # ── Step 2: Create LIBERO-standard HDF5 (replay & render) ─────────────────
     echo ""
-    echo "  ▶ [2/3] Replaying demos and rendering images ..."
+    echo "  ▶ [2/2] Replaying demos and rendering images ..."
     ${PYTHON} scripts/create_dataset.py \
         --demo-file      "${DEMO_HDF5}" \
         --use-camera-obs \
@@ -314,22 +302,6 @@ for BDDL_FILE in "${BDDL_FILES[@]}"; do
 
     echo "  [info] LIBERO HDF5: ${LIBERO_STD_HDF5}"
 
-    # ── Step 3: Filter static frames from the rendered LIBERO-std HDF5 ────────
-    # Now it is safe to filter: all observations have been rendered from the
-    # correct (contiguous) simulation trajectory.  Filtering here simply removes
-    # redundant (obs, action) pairs from the already-rendered dataset.
-    echo ""
-    if [[ "${FILTER_STATIC}" == "true" ]]; then
-        echo "  ▶ [3/3] Filtering static frames from rendered HDF5 ..."
-        ${PYTHON} scripts/filter_static_frames.py \
-            --demo-file        "${LIBERO_STD_HDF5}" \
-            --action-threshold "${ACTION_THRESHOLD}" \
-            --state-threshold  "0.002" \
-            --min-static-run   "${MIN_STATIC_RUN}" \
-            --inplace
-    else
-        echo "  ▶ [3/3] Filtering skipped (--no-filter)."
-    fi
     mark_task_done "${TASK_NAME}"
     PROCESSED=$(( PROCESSED + 1 ))
     echo ""
