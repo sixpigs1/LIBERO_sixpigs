@@ -41,6 +41,7 @@ LEROBOT_OUT_ROOT="${REPO_ROOT}/datasets/lerobot"
 CONDA_ENV="libero"
 UARM_PORT="/dev/ttyUSB0"
 UARM_OUTPUT_MAX="1.0"
+TASK_DEMOS_FILE="${SCRIPT_DIR}/task_demos.jsonl"
 
 # ── Suite name resolver ────────────────────────────────────────────────────────
 resolve_suite() {
@@ -65,7 +66,8 @@ Suite selection (required):
                               All .bddl tasks in that suite will be collected.
 
 Collection options:
-  --num-demonstrations <N>    Demonstrations per task (default: ${NUM_DEMOS}).
+  --num-demonstrations <N>    Default demonstrations per task when not specified in
+                              task_demos.jsonl (default: ${NUM_DEMOS}).
   --device <keyboard|spacemouse|uarm>
                               Teleoperation device (default: ${DEVICE}).
                               'uarm' reads from a physical U-ARM servo arm via
@@ -75,6 +77,9 @@ Collection options:
   --uarm-output-max <float>   JOINT_POSITION output_max in rad/step (default: ${UARM_OUTPUT_MAX}).
                               Hard ceiling per control step; increase for faster arm motion.
                               E.g. 0.2 → ~11.5 deg/step max.
+  --task-demos-file <path>    JSONL file with per-task demo counts
+                              (default: scripts/task_demos.jsonl).
+                              Each line: {"suite":"...","task":"...","num_demos":N}
   --directory <path>          Root dir for collected intermediate demos
                               (default: ./collected_demos).
   --robots <Panda|...>        Robot type for robosuite (default: ${ROBOTS}).
@@ -110,6 +115,7 @@ while [[ $# -gt 0 ]]; do
         --device)              DEVICE="$2";                shift 2 ;;
         --uarm-port)           UARM_PORT="$2";             shift 2 ;;
         --uarm-output-max)     UARM_OUTPUT_MAX="$2";       shift 2 ;;
+        --task-demos-file)     TASK_DEMOS_FILE="$2";       shift 2 ;;
         --directory)           COLLECTED_DIR="$2";         shift 2 ;;
         --robots)              ROBOTS="$2";                shift 2 ;;
         --lerobot-output)      LEROBOT_OUT_ROOT="$2";      shift 2 ;;
@@ -168,7 +174,8 @@ cat <<EOF
 ║              LIBERO Suite Pipeline                               ║
 ╠══════════════════════════════════════════════════════════════════╣
   Suite       : ${SUITE_NAME}  (${TOTAL_TASKS} tasks)
-  Demos/task  : ${NUM_DEMOS}
+  Demos/task  : ${NUM_DEMOS} (default; overridden per task via task_demos.jsonl)
+  Task config : ${TASK_DEMOS_FILE}
   Device      : ${DEVICE}
   Robots      : ${ROBOTS}
   Conda env   : ${CONDA_ENV:-"(current environment)"}
@@ -181,8 +188,27 @@ cat <<EOF
 EOF
 
 cd "${REPO_ROOT}"
-
-# ── Helper: is task already done? ─────────────────────────────────────────────
+# ── Helper: look up num_demos for a task from task_demos.jsonl ────────────────
+#  Falls back to NUM_DEMOS if the file doesn't exist or the task isn't listed.
+get_task_demos() {
+    local suite_name="$1"
+    local task_name="$2"
+    local result=""
+    if [[ -f "${TASK_DEMOS_FILE}" ]]; then
+        result="$(grep '"suite"' "${TASK_DEMOS_FILE}" \
+            | python3 -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    obj = json.loads(line)
+    if obj.get('suite') == sys.argv[1] and obj.get('task') == sys.argv[2]:
+        print(obj.get('num_demos', ''))
+        break
+" "${suite_name}" "${task_name}" 2>/dev/null || true)
+    fi
+    echo "${result:-${NUM_DEMOS}}"
+} ─────────────────────────────────────────────
 task_is_done() {
     local task_name="$1"
     [[ -f "${STATE_FILE}" ]] && grep -qx "${task_name}=done" "${STATE_FILE}"
@@ -234,10 +260,11 @@ PROCESSED=0
 for BDDL_FILE in "${BDDL_FILES[@]}"; do
     TASK_NUM=$(( TASK_NUM + 1 ))
     TASK_NAME="$(basename "${BDDL_FILE}" .bddl)"
+    TASK_NUM_DEMOS="$(get_task_demos "${SUITE_NAME}" "${TASK_NAME}")"
     LIBERO_STD_HDF5="${LIBERO_DATASETS}/${TASK_NAME}_demo.hdf5"
 
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    printf "  Task %d/%d: %s\n" "${TASK_NUM}" "${TOTAL_TASKS}" "${TASK_NAME}"
+    printf "  Task %d/%d: %s  [target: %s demos]\n" "${TASK_NUM}" "${TOTAL_TASKS}" "${TASK_NAME}" "${TASK_NUM_DEMOS}"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     # ── Resume check 1: recorded as done in state file ────────────────────────
@@ -251,14 +278,14 @@ for BDDL_FILE in "${BDDL_FILES[@]}"; do
     # ── Resume check 2: LIBERO-std HDF5 already has enough demos ──────────────
     if [[ -f "${LIBERO_STD_HDF5}" ]]; then
         EXISTING="$(count_demos_in_hdf5 "${LIBERO_STD_HDF5}")"
-        if (( EXISTING >= NUM_DEMOS )); then
-            echo "  [skip] LIBERO HDF5 already has ${EXISTING}/${NUM_DEMOS} demos."
+        if (( EXISTING >= TASK_NUM_DEMOS )); then
+            echo "  [skip] LIBERO HDF5 already has ${EXISTING}/${TASK_NUM_DEMOS} demos."
             mark_task_done "${TASK_NAME}"
             SKIPPED=$(( SKIPPED + 1 ))
             echo ""
             continue
         else
-            echo "  [info] LIBERO HDF5 has ${EXISTING}/${NUM_DEMOS} demos — will redo."
+            echo "  [info] LIBERO HDF5 has ${EXISTING}/${TASK_NUM_DEMOS} demos — will redo."
         fi
     fi
 
@@ -267,13 +294,24 @@ for BDDL_FILE in "${BDDL_FILES[@]}"; do
     mkdir -p "${TASK_COLLECT_DIR}"
 
     # ── Step 1: Collect demonstrations ────────────────────────────────────────
-    DEMO_HDF5="$(find_ready_intermediate "${TASK_NAME}")"
+    # ── Helper: find_ready_intermediate must also use TASK_NUM_DEMOS ──────────
+    DEMO_HDF5=""
+    TASK_COLLECT_DIR_TMP="${SUITE_COLLECTED_DIR}/${TASK_NAME}"
+    if [[ -d "${TASK_COLLECT_DIR_TMP}" ]]; then
+        while IFS= read -r -d '' candidate; do
+            n="$(count_demos_in_hdf5 "${candidate}")"
+            if (( n >= TASK_NUM_DEMOS )); then
+                DEMO_HDF5="${candidate}"
+                break
+            fi
+        done < <(find "${TASK_COLLECT_DIR_TMP}" -name "demo.hdf5" -print0 2>/dev/null)
+    fi
 
     if [[ -n "${DEMO_HDF5}" ]]; then
         echo "  ▶ [1/2] Reusing existing intermediate ($(count_demos_in_hdf5 "${DEMO_HDF5}") demos):"
         echo "          ${DEMO_HDF5}"
     else
-        echo "  ▶ [1/2] Collecting ${NUM_DEMOS} demonstration(s) ..."
+        echo "  ▶ [1/2] Collecting ${TASK_NUM_DEMOS} demonstration(s) ..."
         echo "          Press SPACE to start/stop recording, ESC to finish each demo."
         echo ""
 
@@ -281,7 +319,7 @@ for BDDL_FILE in "${BDDL_FILES[@]}"; do
             --bddl-file         "${BDDL_FILE}" \
             --device            "${DEVICE}" \
             --directory         "${TASK_COLLECT_DIR}" \
-            --num-demonstration "${NUM_DEMOS}" \
+            --num-demonstration "${TASK_NUM_DEMOS}" \
             --robots            "${ROBOTS}" \
             $([[ "${DEVICE}" == "uarm" ]] && echo "--uarm-port ${UARM_PORT} --uarm-output-max ${UARM_OUTPUT_MAX}")
 
