@@ -186,6 +186,7 @@ class UArmDevice(Device):
 
         # Sign and order corrections.
         action[3] = -action[3]          # joint 3 is physically reversed
+        action[4] = action[4] * 5
 
         # Clip to the normalised [-1, 1] input range expected by JOINT_POSITION.
         # action = np.clip(action, -1.0, 1.0)
@@ -193,7 +194,7 @@ class UArmDevice(Device):
         # ── Gripper command (delta, same convention as arm joints) ──────────
         gripper = (
             (curr_offsets[7] - self._prev_offsets[7])
-            * self.sensitivity * 3
+            * self.sensitivity * 8
         )
         # gripper = float(np.clip(gripper_delta_rad, -1.0, 1.0))
         gripper = -gripper

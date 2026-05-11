@@ -245,7 +245,7 @@ if __name__ == "__main__":
         default="spacemouse",
         choices=["keyboard", "spacemouse", "uarm"],
         help="Teleoperation device.  'uarm' requires --controller to be overridden "
-             "to JOINT_POSITION (done automatically).",
+             "to JOINT_VELOCITY (done automatically).",
     )
     parser.add_argument(
         "--uarm-port",
@@ -274,14 +274,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--uarm-sensitivity",
         type=float,
-        default=30,
+        default=16,
         help="How much to scale uaarm user inputs (only applicable if --device=uarm)",
     )
     parser.add_argument(
         "--uarm-output-max",
         type=float,
         default=0.05,
-        help="output_max for the JOINT_POSITION controller when using U-ARM "
+        help="output_max for the JOINT_VELOCITY controller when using U-ARM "
              "(default: 0.05 rad/step). Increase to allow larger per-step joint motion. "
              "E.g. 0.2 allows up to ~11.5 deg/step.",
     )
@@ -299,8 +299,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.device == "uarm":
-        args.controller = "JOINT_POSITION"
-        print("[INFO] U-ARM device selected: controller overridden to JOINT_POSITION.")
+        args.controller = "JOINT_VELOCITY"
+        print("[INFO] U-ARM device selected: controller overridden to JOINT_VELOCITY.")
 
     # Get controller config
     controller_config = load_controller_config(default_controller=args.controller)
@@ -311,7 +311,7 @@ if __name__ == "__main__":
     if args.device == "uarm":
         controller_config["output_max"] = args.uarm_output_max
         controller_config["output_min"] = -args.uarm_output_max
-        print(f"[INFO] JOINT_POSITION output_max set to ±{args.uarm_output_max} rad/step")
+        print(f"[INFO] JOINT_VELOCITY output_max set to ±{args.uarm_output_max} rad/step")
 
     # Create argument configuration
     config = {

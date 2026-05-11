@@ -40,7 +40,7 @@ ROBOTS="Panda"
 LEROBOT_OUT_ROOT="${REPO_ROOT}/datasets/lerobot"
 CONDA_ENV="libero"
 UARM_PORT="/dev/ttyUSB0"
-UARM_OUTPUT_MAX="0.05"
+UARM_OUTPUT_MAX="1.0"
 
 # ── Suite name resolver ────────────────────────────────────────────────────────
 resolve_suite() {
