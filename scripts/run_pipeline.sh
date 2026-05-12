@@ -188,6 +188,7 @@ cat <<EOF
 EOF
 
 cd "${REPO_ROOT}"
+
 # ── Helper: look up num_demos for a task from task_demos.jsonl ────────────────
 #  Falls back to NUM_DEMOS if the file doesn't exist or the task isn't listed.
 get_task_demos() {
@@ -195,20 +196,25 @@ get_task_demos() {
     local task_name="$2"
     local result=""
     if [[ -f "${TASK_DEMOS_FILE}" ]]; then
-        result="$(grep '"suite"' "${TASK_DEMOS_FILE}" \
-            | python3 -c "
+        result="$(python3 - "${TASK_DEMOS_FILE}" "${suite_name}" "${task_name}" <<'PYEOF' 2>/dev/null || true
 import sys, json
-for line in sys.stdin:
-    line = line.strip()
-    if not line: continue
-    obj = json.loads(line)
-    if obj.get('suite') == sys.argv[1] and obj.get('task') == sys.argv[2]:
-        print(obj.get('num_demos', ''))
-        break
-" "${suite_name}" "${task_name}" 2>/dev/null || true)
+fpath, suite, task = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(fpath) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        obj = json.loads(line)
+        if obj.get("suite") == suite and obj.get("task") == task:
+            print(obj.get("num_demos", ""))
+            break
+PYEOF
+)"
     fi
     echo "${result:-${NUM_DEMOS}}"
-} ─────────────────────────────────────────────
+}
+
+# ── Helper: is task already done? ─────────────────────────────────────────────
 task_is_done() {
     local task_name="$1"
     [[ -f "${STATE_FILE}" ]] && grep -qx "${task_name}=done" "${STATE_FILE}"
